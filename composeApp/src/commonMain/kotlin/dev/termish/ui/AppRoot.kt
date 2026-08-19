@@ -138,6 +138,11 @@ fun AppRoot(repository: HostRepository) {
     var pendingNavigate by remember { mutableStateOf<TerminalController?>(null) }
     /** SFTP：选主机覆盖层 / 当前会话 / 认证与主机密钥弹窗。 */
     var sftpPickerVisible by remember { mutableStateOf(false) }
+    /** VNC：选主机覆盖层 / 编辑页（新建或编辑，null = 未打开）。 */
+    var vncPickerVisible by remember { mutableStateOf(false) }
+    var vncEditHostId by remember { mutableStateOf<String?>(null) }
+    var vncHosts by remember { mutableStateOf(repository.listVncHosts()) }
+    var refreshVncHosts = { vncHosts = repository.listVncHosts() }
     var sftpAuth by remember { mutableStateOf<AuthPromptRequest?>(null) }
     var sftpHostKey by remember { mutableStateOf<HostKeyRequest?>(null) }
     val snackbarHostState = remember { SnackbarHostState() }
@@ -221,6 +226,30 @@ fun AppRoot(repository: HostRepository) {
                 }
             } catch (e: Exception) {
                 snackbarHostState.showSnackbar(appStrings.sftpConnectFailed(e.message ?: ""))
+            }
+        }
+    }
+
+    // VNC：选主机后建立连接（密码从安全存储读取，无认证弹窗——VNC 密码存主机配置）
+    val connectVnc: (dev.termish.data.VncHost) -> Unit = { vncHost ->
+        vncPickerVisible = false
+        scope.launch {
+            try {
+                val password = SecretStore.get(SECRET_SERVICE, secretAccountFor(vncHost.id, "vncPassword"))
+                val client = dev.termish.vnc.RfbClient(
+                    host = vncHost.hostname,
+                    port = vncHost.port,
+                    password = password,
+                    viewOnly = vncHost.viewOnly,
+                    scope = scope,
+                )
+                client.connect()
+                val entry = sessionManager.addVnc(vncHost, client)
+                repository.touchVncConnected(vncHost.id)
+                currentTab = SessionTab.Vnc(vncHost, client, entry.uiState)
+                screen = Screen.Terminal
+            } catch (e: Exception) {
+                snackbarHostState.showSnackbar(appStrings.vnc.connectFailed(e.message ?: ""))
             }
         }
     }
@@ -456,6 +485,7 @@ fun AppRoot(repository: HostRepository) {
                                         currentTab = SessionTab.Sftp(host, session, entry?.uiState ?: SftpUiState())
                                         screen = Screen.Terminal
                                     },
+                                    onOpenVnc = { vncPickerVisible = true },
                                     onCloseAllSessions = { host ->
                                         // 关闭该主机全部会话：终端断开保留 + SFTP 释放
                                         sessionManager.closeAllForHost(host.id)
@@ -471,7 +501,8 @@ fun AppRoot(repository: HostRepository) {
 
                                 HomeTab.CONNECTIONS -> ConnectionsScreen(
                                     sessions = sessionManager.sessions.map { HostSessionItem.Terminal(it) } +
-                                        sessionManager.sftpSessions.map { HostSessionItem.Sftp(it.host, it.session) },
+                                        sessionManager.sftpSessions.map { HostSessionItem.Sftp(it.host, it.session) } +
+                                        sessionManager.vncSessions.map { HostSessionItem.Vnc(it.host, it.client) },
                                     onOpen = { item ->
                                         when (item) {
                                             is HostSessionItem.Terminal -> {
@@ -486,6 +517,13 @@ fun AppRoot(repository: HostRepository) {
                                                 currentTab = SessionTab.Sftp(item.host, item.session, entry?.uiState ?: SftpUiState())
                                                 screen = Screen.Terminal
                                             }
+                                            is HostSessionItem.Vnc -> {
+                                                val entry = sessionManager.vncSessions.firstOrNull {
+                                                    it.host.id == item.host.id && it.client === item.client
+                                                }
+                                                currentTab = SessionTab.Vnc(item.host, item.client, entry?.uiState ?: VncUiState())
+                                                screen = Screen.Terminal
+                                            }
                                         }
                                     },
                                     onClose = { item ->
@@ -498,6 +536,11 @@ fun AppRoot(repository: HostRepository) {
                                                 sessionManager.sftpSessions
                                                     .firstOrNull { it.session === item.session }
                                                     ?.let { sessionManager.closeSftp(it) }
+                                            }
+                                            is HostSessionItem.Vnc -> {
+                                                sessionManager.vncSessions
+                                                    .firstOrNull { it.host.id == item.host.id && it.client === item.client }
+                                                    ?.let { sessionManager.closeVnc(it) }
                                             }
                                         }
                                     },
@@ -545,15 +588,18 @@ fun AppRoot(repository: HostRepository) {
                     val terminalTabs = sessionManager.sessions.map { SessionTab.Terminal(it) }
                     val sftpTabs = sessionManager.sftpSessions
                         .map { SessionTab.Sftp(it.host, it.session, it.uiState) }
+                    val vncTabs = sessionManager.vncSessions
+                        .map { SessionTab.Vnc(it.host, it.client, it.uiState) }
                     val current = currentTab?.takeIf { tab ->
-                        tab.id in (terminalTabs.map { it.id } + sftpTabs.map { it.id })
-                    } ?: (terminalTabs + sftpTabs).firstOrNull()
+                        tab.id in (terminalTabs.map { it.id } + sftpTabs.map { it.id } + vncTabs.map { it.id })
+                    } ?: (terminalTabs + sftpTabs + vncTabs).firstOrNull()
                     if (current != null) {
-                        val tabs = terminalTabs + sftpTabs
-                        // 「+」新增会话归属：当前选中会话的主机（SFTP tab 用其主机）
+                        val tabs = terminalTabs + sftpTabs + vncTabs
+                        // 「+」新增会话归属：当前选中会话的主机（SFTP/VNC tab 无 SSH 主机，退回首终端 tab 的主机）
                         val currentHost = when (current) {
                             is SessionTab.Terminal -> current.controller.host
                             is SessionTab.Sftp -> current.host
+                            is SessionTab.Vnc -> sessionManager.sessions.firstOrNull()?.host
                         }
                         TerminalScreen(
                             tabs = tabs,
@@ -568,10 +614,13 @@ fun AppRoot(repository: HostRepository) {
                             },
                             onSwitchTab = { currentTab = it },
                             onAddSession = {
-                                val c = sessionManager.open(currentHost, settings.autoReconnect) {
-                                    hosts = repository.listHosts()
+                                val host = currentHost
+                                if (host != null) {
+                                    val c = sessionManager.open(host, settings.autoReconnect) {
+                                        hosts = repository.listHosts()
+                                    }
+                                    pendingNavigate = c
                                 }
-                                pendingNavigate = c
                             },
                             onCloseTab = { tab ->
                                 when (tab) {
@@ -581,11 +630,18 @@ fun AppRoot(repository: HostRepository) {
                                             .firstOrNull { it.session === tab.session }
                                             ?.let { sessionManager.closeSftp(it) }
                                     }
+                                    is SessionTab.Vnc -> {
+                                        sessionManager.vncSessions
+                                            .firstOrNull { it.host.id == tab.host.id && it.client === tab.client }
+                                            ?.let { sessionManager.closeVnc(it) }
+                                    }
                                 }
                                 val remaining = (sessionManager.sessions
                                     .map { SessionTab.Terminal(it) } +
                                     sessionManager.sftpSessions
-                                        .map { SessionTab.Sftp(it.host, it.session, it.uiState) })
+                                        .map { SessionTab.Sftp(it.host, it.session, it.uiState) } +
+                                    sessionManager.vncSessions
+                                        .map { SessionTab.Vnc(it.host, it.client, it.uiState) })
                                     .firstOrNull { it.id != tab.id }
                                 currentTab = remaining
                                 if (remaining == null) {
@@ -594,6 +650,32 @@ fun AppRoot(repository: HostRepository) {
                                 }
                             },
                             onOpenSftpPicker = { sftpPickerVisible = true },
+                            onOpenVncPicker = { vncPickerVisible = true },
+                            // VNC 断线重连：新建 client 替换 tab（保留 uiState 视口）
+                            onReconnectVnc = { tab ->
+                                val entry = sessionManager.vncSessions.find {
+                                    it.host.id == tab.host.id && it.client === tab.client
+                                }
+                                scope.launch {
+                                    try {
+                                        val password = SecretStore.get(SECRET_SERVICE, secretAccountFor(tab.host.id, "vncPassword"))
+                                        val client = dev.termish.vnc.RfbClient(
+                            host = tab.host.hostname,
+                            port = tab.host.port,
+                            password = password,
+                            viewOnly = tab.host.viewOnly,
+                            scope = scope,
+                        )
+                        client.connect()
+                        entry?.let { sessionManager.reconnectVnc(it, client) }
+                        tab.uiState.disconnected = false
+                        tab.uiState.loadError = null
+                        currentTab = SessionTab.Vnc(tab.host, client, tab.uiState)
+                                    } catch (e: Exception) {
+                                        tab.uiState.loadError = e.message
+                                    }
+                                }
+                            },
                             // SFTP 断线重连：重建会话替换 tab（保留 uiState 的路径/列表）
                             onReconnectSftp = { tab ->
                                 // session 可空（进程重启恢复条目）：host.id + 引用双重匹配，
@@ -628,6 +710,37 @@ fun AppRoot(repository: HostRepository) {
                     hosts = hosts,
                     onDismiss = { sftpPickerVisible = false },
                     onSelect = connectSftp,
+                )
+            }
+
+            // New VNC connection 覆盖层 + VNC 主机编辑页（vncEditHostId="new" = 新建）
+            if (vncEditHostId != null) {
+                val editingId = vncEditHostId
+                val existing = if (editingId == "new") null else vncHosts.firstOrNull { it.id == editingId }
+                VncHostEditScreen(
+                    existing = existing,
+                    repository = repository,
+                    onSave = {
+                        refreshVncHosts()
+                        vncEditHostId = null
+                    },
+                    onDelete = { deleted ->
+                        // 连带关闭该主机的活跃 VNC 会话
+                        sessionManager.vncSessions
+                            .filter { it.host.id == deleted.id }
+                            .toList()
+                            .forEach { sessionManager.closeVnc(it) }
+                        refreshVncHosts()
+                        vncEditHostId = null
+                    },
+                    onBack = { vncEditHostId = null },
+                )
+            } else if (vncPickerVisible) {
+                VncHostPickerOverlay(
+                    hosts = vncHosts,
+                    onDismiss = { vncPickerVisible = false },
+                    onSelect = connectVnc,
+                    onAddHost = { vncEditHostId = "new" },
                 )
             }
 

@@ -66,14 +66,15 @@ fun ConnectionsScreen(
         }
     }
     val filtered = sessions.filter { item ->
-            val host = when (item) {
-                is HostSessionItem.Terminal -> item.controller.host
-                is HostSessionItem.Sftp -> item.host
+            val (name, hostname, username) = when (item) {
+                is HostSessionItem.Terminal -> item.controller.host.let { Triple(it.name, it.hostname, it.username) }
+                is HostSessionItem.Sftp -> item.host.let { Triple(it.name, it.hostname, it.username) }
+                is HostSessionItem.Vnc -> Triple(item.host.name, item.host.hostname, "")
             }
             query.isBlank() ||
-                host.name.contains(query, ignoreCase = true) ||
-                host.hostname.contains(query, ignoreCase = true) ||
-                host.username.contains(query, ignoreCase = true)
+                name.contains(query, ignoreCase = true) ||
+                hostname.contains(query, ignoreCase = true) ||
+                username.contains(query, ignoreCase = true)
         }
 
     Scaffold(
@@ -152,15 +153,18 @@ fun ConnectionsScreen(
                         when (it) {
                             is HostSessionItem.Terminal -> it.controller.sessionId
                             is HostSessionItem.Sftp -> "sftp:${it.host.id}:${it.session.hashCode()}"
+                            is HostSessionItem.Vnc -> "vnc:${it.host.id}:${it.client.hashCode()}"
                         }
                     }) { item ->
-                        val host = when (item) {
-                            is HostSessionItem.Terminal -> item.controller.host
-                            is HostSessionItem.Sftp -> item.host
-                        }
                         val title = when (item) {
                             is HostSessionItem.Terminal -> item.controller.title
-                            is HostSessionItem.Sftp -> "${host.username}@${host.hostname}"
+                            is HostSessionItem.Sftp -> "${item.host.username}@${item.host.hostname}"
+                            is HostSessionItem.Vnc -> item.host.name.ifBlank { item.host.hostname }
+                        }
+                        val detail = when (item) {
+                            is HostSessionItem.Terminal -> "${item.controller.host.username}@${item.controller.host.hostname}:${item.controller.host.port}"
+                            is HostSessionItem.Sftp -> "${item.host.username}@${item.host.hostname} · SFTP"
+                            is HostSessionItem.Vnc -> "${item.host.hostname}:${item.host.port} · VNC"
                         }
                         val active = item.isActive
                         Card(
@@ -175,11 +179,7 @@ fun ConnectionsScreen(
                                 },
                                 supportingContent = {
                                     Text(
-                                        if (item is HostSessionItem.Sftp) {
-                                            "${host.username}@${host.hostname} · SFTP"
-                                        } else {
-                                            "${host.username}@${host.hostname}:${host.port}"
-                                        },
+                                        detail,
                                         maxLines = 1,
                                         overflow = TextOverflow.Ellipsis,
                                     )

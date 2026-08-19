@@ -79,7 +79,9 @@ import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.dp
 import dev.termish.data.ConnectionMode
 import dev.termish.data.Host
+import dev.termish.data.VncHost
 import dev.termish.ssh.SftpSession
+import dev.termish.vnc.RfbClient
 import dev.termish.ui.theme.StatusColors
 import dev.termish.generated.resources.Res
 import dev.termish.generated.resources.host_centos
@@ -115,6 +117,13 @@ sealed interface HostSessionItem {
         override val isConnecting: Boolean get() = false
         override val isConnected: Boolean get() = session != null
     }
+
+    data class Vnc(val host: VncHost, val client: RfbClient?) : HostSessionItem {
+        override val hostId: String get() = host.id
+        override val isActive: Boolean get() = client != null
+        override val isConnecting: Boolean get() = false
+        override val isConnected: Boolean get() = client != null
+    }
 }
 
 /** 活跃会话判定：连接中/认证中/已连接都算（与连接页状态点同源）。 */
@@ -134,6 +143,8 @@ fun HostListScreen(
     onDelete: (Host) -> Unit,
     onOpenSession: (TerminalController) -> Unit,
     onOpenSftp: (Host, SftpSession?) -> Unit,
+    /** 首页 header 打开 VNC 选主机（无 SSH 主机也能到达 VNC）。 */
+    onOpenVnc: () -> Unit = {},
     onCloseAllSessions: (Host) -> Unit,
 ) {
     val s = LocalAppStrings.current
@@ -206,6 +217,9 @@ fun HostListScreen(
                 TermishLargeHeader(
                     title = s.appTabHosts,
                     actions = {
+                        IconButton(onClick = onOpenVnc) {
+                            Icon(Icons.Filled.DesktopWindows, contentDescription = s.vnc.newTitle)
+                        }
                         IconButton(
                             onClick = {
                                 if (searchExpanded) {
@@ -297,6 +311,7 @@ fun HostListScreen(
                                     when (val target = sessions.firstOrNull { it.isActive } ?: sessions.firstOrNull()) {
                                         is HostSessionItem.Terminal -> onOpenSession(target.controller)
                                         is HostSessionItem.Sftp -> onOpenSftp(target.host, target.session)
+                                        is HostSessionItem.Vnc -> null
                                         null -> onConnect(host)
                                     }
                                 }
@@ -634,6 +649,7 @@ private fun SessionCountMenu(
                         else -> s.connStatusClosed
                     }
                     is HostSessionItem.Sftp -> s.hostsActive
+                    is HostSessionItem.Vnc -> s.hostsActive
                 }
                 val statusColor = when (item) {
                     is HostSessionItem.Terminal -> when (item.controller.status) {
@@ -642,8 +658,10 @@ private fun SessionCountMenu(
                         else -> StatusColors.Neutral
                     }
                     is HostSessionItem.Sftp -> StatusColors.Connected
+                    is HostSessionItem.Vnc -> StatusColors.Connected
                 }
                 when (item) {
+                    is HostSessionItem.Vnc -> {}
                     is HostSessionItem.Terminal -> DropdownMenuItem(
                         text = {
                             Text(

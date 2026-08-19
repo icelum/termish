@@ -29,6 +29,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.automirrored.filled.KeyboardArrowLeft
 import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.DesktopWindows
 import androidx.compose.material.icons.filled.FolderOpen
 import androidx.compose.material.icons.filled.Link
 import androidx.compose.material.icons.filled.Terminal
@@ -97,6 +98,8 @@ import dev.termish.ssh.SftpSession
 import dev.termish.ssh.AuthPrompt
 import dev.termish.term.argbToRgb
 import dev.termish.ui.theme.StatusColors
+import dev.termish.vnc.RfbClient
+import dev.termish.data.VncHost
 import dev.termish.ui.theme.TerminalTheme
 import dev.termish.util.monospaceFontFamily
 import dev.termish.util.hapticTick
@@ -104,7 +107,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import org.jetbrains.compose.resources.painterResource
 
-/** 终端页会话 tab：SSH/Mosh 终端 或 SFTP 文件浏览器。 */
+/** 终端页会话 tab：SSH/Mosh 终端、SFTP 文件浏览器 或 VNC 远程桌面。 */
 sealed interface SessionTab {
     val id: String
 
@@ -118,6 +121,14 @@ sealed interface SessionTab {
         val uiState: SftpUiState = SftpUiState(),
     ) : SessionTab {
         override val id: String get() = "sftp:${host.id}:${session?.hashCode() ?: "restored"}"
+    }
+
+    data class Vnc(
+        val host: VncHost,
+        val client: RfbClient?,
+        val uiState: VncUiState = VncUiState(),
+    ) : SessionTab {
+        override val id: String get() = "vnc:${host.id}:${client?.hashCode() ?: "restored"}"
     }
 }
 
@@ -144,6 +155,9 @@ fun TerminalScreen(
     onAddSession: () -> Unit,
     onCloseTab: (SessionTab) -> Unit,
     onOpenSftpPicker: () -> Unit,
+    onOpenVncPicker: () -> Unit = {},
+    /** VNC 断线重连：重建 client 后替换 tab。 */
+    onReconnectVnc: (SessionTab.Vnc) -> Unit = {},
     /** SFTP 断线重连：重建会话后替换 tab 中的 session（由 AppRoot 实现）。 */
     onReconnectSftp: (SessionTab.Sftp) -> Unit = {},
 ) {
@@ -164,6 +178,7 @@ fun TerminalScreen(
             onAdd = onAddSession,
             onClose = { pendingClose = it },
             onSftp = onOpenSftpPicker,
+            onVnc = onOpenVncPicker,
             theme = theme,
         )
         when (val tab = current) {
@@ -181,18 +196,27 @@ fun TerminalScreen(
                 onBack = onBack,
                 onReconnect = { onReconnectSftp(tab) },
             )
+            is SessionTab.Vnc -> VncContent(
+                host = tab.host,
+                client = tab.client,
+                state = tab.uiState,
+                theme = theme,
+                onBack = onBack,
+                onReconnect = { onReconnectVnc(tab) },
+            )
         }
     }
 
     pendingClose?.let { tab ->
         val host = when (tab) {
-            is SessionTab.Terminal -> tab.controller.host
-            is SessionTab.Sftp -> tab.host
+            is SessionTab.Terminal -> "${tab.controller.host.username}@${tab.controller.host.hostname}"
+            is SessionTab.Sftp -> "${tab.host.username}@${tab.host.hostname}"
+            is SessionTab.Vnc -> tab.host.name.ifBlank { tab.host.hostname }
         }
         AlertDialog(
             onDismissRequest = { pendingClose = null },
             title = { Text(s.terminalCloseTabTitle) },
-            text = { Text(s.terminalCloseTabBody("${host.username}@${host.hostname}")) },
+            text = { Text(s.terminalCloseTabBody(host)) },
             confirmButton = {
                 TextButton(
                     onClick = {
@@ -543,6 +567,7 @@ private fun TerminalTabBar(
     onAdd: () -> Unit,
     onClose: (SessionTab) -> Unit,
     onSftp: () -> Unit,
+    onVnc: () -> Unit = {},
     theme: TerminalTheme,
 ) {
     val s = LocalAppStrings.current
@@ -608,9 +633,10 @@ private fun TerminalTabBar(
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
                 tabs.forEach { tab ->
-                    val host = when (tab) {
-                        is SessionTab.Terminal -> tab.controller.host
-                        is SessionTab.Sftp -> tab.host
+                    val chipTitle = when (tab) {
+                        is SessionTab.Terminal -> "${tab.controller.host.username}@${tab.controller.host.hostname}"
+                        is SessionTab.Sftp -> "${tab.host.username}@${tab.host.hostname}"
+                        is SessionTab.Vnc -> tab.host.name.ifBlank { "vnc:${tab.host.hostname}" }
                     }
                     val statusColor = (tab as? SessionTab.Terminal)?.let {
                         statusColor(it.controller.status, it.controller.linkLostSeconds)
@@ -621,7 +647,12 @@ private fun TerminalTabBar(
                         st != ConnStatus.CONNECTED && st != ConnStatus.CONNECTING && st != ConnStatus.AUTH
                     } ?: false
                     SessionTabChip(
-                        host = host,
+                        title = chipTitle,
+                        sys = when (tab) {
+                            is SessionTab.Terminal -> tab.controller.host.system.ifBlank { tab.controller.host.hostname }
+                            is SessionTab.Sftp -> tab.host.system.ifBlank { tab.host.hostname }
+                            is SessionTab.Vnc -> ""
+                        },
                         statusDotColor = statusColor,
                         inactive = inactive,
                         selected = tab.id == current.id,
@@ -658,6 +689,14 @@ private fun TerminalTabBar(
                             onSftp()
                         },
                     )
+                    DropdownMenuItem(
+                        text = { Text(s.vnc.hostsConnectVnc) },
+                        leadingIcon = { Icon(Icons.Filled.DesktopWindows, null) },
+                        onClick = {
+                            addOpen = false
+                            onVnc()
+                        },
+                    )
                 }
             }
         }
@@ -667,7 +706,9 @@ private fun TerminalTabBar(
 /** 单个会话 tab：系统小头像 + user@host + 关闭 X；当前 tab 高亮并显示连接状态点。 */
 @Composable
 private fun SessionTabChip(
-    host: Host,
+    title: String,
+    /** 头像系统标识（头像图标/颜色用）；空串 = VNC 桌面默认。 */
+    sys: String = "",
     statusDotColor: Color?,
     /** 断开/失败的会话：文字与背景降透明度（状态点仍保留区分）。 */
     inactive: Boolean = false,
@@ -677,7 +718,7 @@ private fun SessionTabChip(
     onClose: () -> Unit,
     onPositioned: (x: Float, width: Float) -> Unit,
 ) {
-    val sys = host.system.ifBlank { host.hostname }
+    val avatarSys = sys.ifBlank { "windows" }
     Row(
         Modifier
             .clip(RoundedCornerShape(8.dp))
@@ -694,19 +735,19 @@ private fun SessionTabChip(
     ) {
         // 系统小头像
         Box(
-            Modifier.size(18.dp).clip(RoundedCornerShape(5.dp)).background(systemColor(sys)),
+            Modifier.size(18.dp).clip(RoundedCornerShape(5.dp)).background(systemColor(avatarSys)),
             contentAlignment = Alignment.Center,
         ) {
-            val svg = systemSvg(sys)
+            val svg = systemSvg(avatarSys)
             if (svg != null) {
                 Icon(painterResource(svg), null, tint = Color.White, modifier = Modifier.size(11.dp))
             } else {
-                Icon(systemIcon(sys), null, tint = Color.White, modifier = Modifier.size(11.dp))
+                Icon(systemIcon(avatarSys), null, tint = Color.White, modifier = Modifier.size(11.dp))
             }
         }
         Spacer(Modifier.size(6.dp))
         Text(
-            "${host.username}@${host.hostname}",
+            title,
             style = MaterialTheme.typography.labelSmall,
             color = if (inactive) foreground.copy(alpha = 0.4f) else foreground,
             maxLines = 1,

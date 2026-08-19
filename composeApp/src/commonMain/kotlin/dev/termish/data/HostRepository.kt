@@ -122,6 +122,38 @@ class HostRepository(
         settings.putString(snippetsKey, json.encodeToString(listSnippets().filter { it.id != id }))
     }
 
+    // ---------- VNC 主机 ----------
+
+    private val vncHostsKey = "termish.vnc_hosts.v1"
+
+    fun listVncHosts(): List<VncHost> {
+        val raw = settings.getStringOrNull(vncHostsKey) ?: return emptyList()
+        return try {
+            json.decodeFromString<List<VncHost>>(raw)
+        } catch (e: Exception) {
+            backupCorrupt(vncHostsKey, raw)
+            emptyList()
+        }
+    }
+
+    fun upsertVncHost(host: VncHost) {
+        val hosts = listVncHosts().toMutableList()
+        val idx = hosts.indexOfFirst { it.id == host.id }
+        if (idx >= 0) hosts[idx] = host else hosts.add(host)
+        settings.putString(vncHostsKey, json.encodeToString(hosts))
+    }
+
+    fun deleteVncHost(id: String) {
+        settings.putString(vncHostsKey, json.encodeToString(listVncHosts().filter { it.id != id }))
+    }
+
+    fun touchVncConnected(id: String) {
+        settings.putString(
+            vncHostsKey,
+            json.encodeToString(listVncHosts().map { if (it.id == id) it.copy(lastConnectedAt = currentTimeMillis()) else it }),
+        )
+    }
+
     // ---------- 设置 ----------
 
     fun loadSettings(): AppSettings {

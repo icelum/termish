@@ -9,6 +9,8 @@ import dev.termish.ssh.SftpSession
 import dev.termish.util.TermLog
 import dev.termish.util.base64Encode
 import dev.termish.util.ioDispatcher
+import dev.termish.vnc.RfbClient
+import dev.termish.data.VncHost
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
@@ -21,6 +23,13 @@ data class SftpSessionEntry(
     val session: SftpSession?,
     /** 浏览状态（路径/列表/排序等）：随条目存活，切 tab 不重置。 */
     val uiState: SftpUiState = SftpUiState(),
+)
+
+/** VNC 会话条目（与 SFTP 平级管理）。[client] 可空：重连中。 */
+data class VncSessionEntry(
+    val host: VncHost,
+    val client: RfbClient?,
+    val uiState: VncUiState = VncUiState(),
 )
 
 /**
@@ -37,6 +46,8 @@ class SessionManager(
     val sessions = mutableStateListOf<TerminalController>()
     /** SFTP 会话（与终端会话同源管理：连接页可见、卡片 Close 可关、删除主机连带释放）。 */
     val sftpSessions = mutableStateListOf<SftpSessionEntry>()
+    /** VNC 会话（与 SFTP 同源管理：连接页可见、关闭 tab 释放）。 */
+    val vncSessions = mutableStateListOf<VncSessionEntry>()
 
     private val scope = CoroutineScope(SupervisorJob() + ioDispatcher())
     /** 退到后台时仍活跃的会话 id（回前台据此自动重连，iOS 场景）。 */
@@ -188,6 +199,36 @@ class SessionManager(
         }
         sftpSessions.remove(entry)
         persist()
+    }
+
+    /** 新建（或复用）VNC 会话条目：同主机已有活跃条目则复用。 */
+    fun addVnc(host: VncHost, client: RfbClient?): VncSessionEntry {
+        val existing = vncSessions.firstOrNull { it.host.id == host.id }
+        if (existing != null) {
+            existing.client?.close()
+            val idx = vncSessions.indexOf(existing)
+            val fresh = VncSessionEntry(host, client, existing.uiState)
+            vncSessions[idx] = fresh
+            return fresh
+        }
+        val entry = VncSessionEntry(host, client)
+        vncSessions.add(entry)
+        return entry
+    }
+
+    /** 重连后替换 client（保留 uiState：视口/粘滞修饰键状态）。 */
+    fun reconnectVnc(entry: VncSessionEntry, client: RfbClient) {
+        val idx = vncSessions.indexOf(entry)
+        if (idx >= 0) vncSessions[idx] = VncSessionEntry(entry.host, client, entry.uiState)
+    }
+
+    /** 关闭并移除 VNC 会话。 */
+    fun closeVnc(entry: VncSessionEntry) {
+        try {
+            entry.client?.close()
+        } catch (_: Exception) {
+        }
+        vncSessions.remove(entry)
     }
 
     /** 关闭主机的全部会话：终端断开保留可重入 + SFTP 释放（卡片 Close）。 */

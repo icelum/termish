@@ -43,7 +43,6 @@ import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.FilterQuality
-import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.input.key.Key
 import androidx.compose.ui.input.key.KeyEvent
 import androidx.compose.ui.input.key.KeyEventType
@@ -136,14 +135,7 @@ fun VncContent(
         val f = frame ?: return@LaunchedEffect
         if (f.version == drawVersion) return@LaunchedEffect
         drawVersion = f.version
-        val bm = bitmap ?: VncBitmap(f.width, f.height).also {
-            bitmap = it
-            // 首帧：箭头初始置于画面中心
-            if (state.pointerX < 0) {
-                state.pointerX = f.width / 2f
-                state.pointerY = f.height / 2f
-            }
-        }
+        val bm = bitmap ?: VncBitmap(f.width, f.height).also { bitmap = it }
         bm.update(f.pixels)
     }
     // 远端剪贴板 → 本机
@@ -157,53 +149,58 @@ fun VncContent(
     // 连接状态观察：断线时置 banner（RfbClient 状态非 Compose state，轮询足够）
     VncStatusWatcher(client, state)
 
-    // 视口换算：屏幕坐标 → framebuffer 坐标
-    fun toFrameX(x: Float): Float = x / state.scale - state.offsetX
-    fun toFrameY(y: Float): Float = y / state.scale - state.offsetY
-    fun sendPointerAt(buttonMask: Int, fx: Float, fy: Float) {
-        state.pointerX = fx
-        state.pointerY = fy
-        client?.pointerEvent(buttonMask, fx.roundToInt().coerceIn(0, 32767), fy.roundToInt().coerceIn(0, 32767))
+    // 视口换算：屏幕坐标 → framebuffer 坐标（fit 缩放 + 居中偏移 + 视口 offset）
+    fun screenToFrame(sx: Float, sy: Float): Pair<Float, Float> {
+        val f = frame ?: return 0f to 0f
+        if (f.width == 0) return 0f to 0f
+        val fit = if (canvasSize.width > 0) canvasSize.width.toFloat() / f.width else 1f
+        val ds = fit * state.scale
+        val baseX = (canvasSize.width - f.width * ds) / 2f
+        val baseY = (canvasSize.height - f.height * ds) / 2f
+        return ((sx - baseX) / ds - state.offsetX) to ((sy - baseY) / ds - state.offsetY)
     }
 
-    fun clickButton(mask: Int) {
-        val x = state.pointerX.takeIf { it >= 0 } ?: (frame?.width?.div(2f)) ?: return
-        val y = state.pointerY.takeIf { it >= 0 } ?: (frame?.height?.div(2f)) ?: return
+    /** 在屏幕位置点击：直接映射到手指触摸点（buttonMask bit0=左 bit2=右）。 */
+    fun clickAt(sx: Float, sy: Float, mask: Int) {
+        val f = frame ?: return
+        val (fx, fy) = screenToFrame(sx, sy)
+        val x = fx.roundToInt().coerceIn(0, f.width - 1)
+        val y = fy.roundToInt().coerceIn(0, f.height - 1)
+        // 记录最后交互位置：工具栏左/右键在没有触摸时作用于这里
+        state.pointerX = fx
+        state.pointerY = fy
+        TermLog.d("vnc-ui") { "click mask=$mask at $x,$y client=$client" }
+        client?.pointerEvent(mask, x, y)
+        client?.pointerEvent(0, x, y)
+    }
+
+    /** 视口平移：屏幕 px 增量 → offset 增量（内容跟随手指；fit = 画布宽/帧宽）。 */
+    fun panBy(dx: Float, dy: Float) {
+        val f = frame ?: return
+        if (f.width == 0) return
+        val fit = if (canvasSize.width > 0) canvasSize.width.toFloat() / f.width else 1f
+        val ds = fit * state.scale
+        state.offsetX += dx / ds
+        state.offsetY += dy / ds
+        clampViewport(state, f.width, f.height, canvasSize)
+    }
+
+    /** 工具栏鼠标键：作用于最后交互位置（未交互过则画布中心）。 */
+    fun toolbarClick(mask: Int) {
+        val f = frame ?: return
+        val x = state.pointerX.takeIf { it >= 0 } ?: (f.width / 2f)
+        val y = state.pointerY.takeIf { it >= 0 } ?: (f.height / 2f)
         client?.pointerEvent(mask, x.roundToInt(), y.roundToInt())
         client?.pointerEvent(0, x.roundToInt(), y.roundToInt())
     }
 
     fun wheel(up: Boolean) {
+        val f = frame ?: return
         val mask = if (up) 0x08 else 0x10
-        val x = state.pointerX.takeIf { it >= 0 } ?: (frame?.width?.div(2f)) ?: return
-        val y = state.pointerY.takeIf { it >= 0 } ?: (frame?.height?.div(2f)) ?: return
+        val x = state.pointerX.takeIf { it >= 0 } ?: (f.width / 2f)
+        val y = state.pointerY.takeIf { it >= 0 } ?: (f.height / 2f)
         client?.pointerEvent(mask, x.roundToInt(), y.roundToInt())
         client?.pointerEvent(0, x.roundToInt(), y.roundToInt())
-    }
-
-    // 虚拟鼠标点击：作用于箭头位置（手指触点无关）
-    fun leftClickAtPointer() {
-        // 箭头未初始化（首帧前）时先置中
-        if (state.pointerX < 0) {
-            state.pointerX = (frame?.width ?: 640) / 2f
-            state.pointerY = (frame?.height ?: 480) / 2f
-        }
-        val x = state.pointerX.roundToInt().coerceAtLeast(0)
-        val y = state.pointerY.roundToInt().coerceAtLeast(0)
-        client?.pointerEvent(1, x, y)
-        client?.pointerEvent(0, x, y)
-    }
-
-    fun rightClickAtPointer() {
-        val x = state.pointerX.roundToInt().coerceAtLeast(0)
-        val y = state.pointerY.roundToInt().coerceAtLeast(0)
-        client?.pointerEvent(4, x, y)
-        client?.pointerEvent(0, x, y)
-    }
-
-    fun doubleClickAtPointer() {
-        leftClickAtPointer()
-        leftClickAtPointer()
     }
 
     // 键盘：隐藏输入框接收软键盘/硬件键盘
@@ -264,93 +261,50 @@ fun VncContent(
                     Modifier
                         .fillMaxSize()
                         .pointerInput(frame.width, frame.height, client) {
-                            // 虚拟鼠标模式（VNC 客户端标准手感）：手指当触控板——
-                            // 拖动只移动屏幕上的鼠标箭头（相对位移，不发送事件）；
-                            // 点按在箭头位置触发（不跳到手指位置）
                             awaitEachGesture {
                                 val down = awaitFirstDown(requireUnconsumed = false)
+                                val downTime = nowMillis()
                                 var moved = false
-                                var last = down.position
-                                var isPointerEvent = false
-                                var sentDown = false
+                                var lastPos = down.position
                                 var lastPinchDist: Float? = null
                                 var lastPinchCentroid = Offset.Zero
-                                val downTime = nowMillis()
                                 try {
                                     while (true) {
                                         val ev = awaitPointerEvent()
                                         if (ev.changes.all { !it.pressed }) break // up
-                                        val change = ev.changes.firstOrNull { it.pressed } ?: continue
-                                        val delta = change.position - last
-                                        last = change.position
-                                        if (delta.getDistance() > tapSlopPx) moved = true
-                                        val pressedCount = ev.changes.count { it.pressed }
-                                        if (pressedCount >= 2) {
-                                            // 双指 = 捏拉缩放 + 双指平移（原位处理：
-                                            // 交给 detectTransformGestures 会因第二指
-                                            // 中途加入而识别不到，实测捏不动）
-                                            if (isPointerEvent) {
-                                                client?.pointerEvent(0, state.pointerX.roundToInt(), state.pointerY.roundToInt())
-                                                isPointerEvent = false
-                                            }
+                                        val pressed = ev.changes.filter { it.pressed }
+                                        if (pressed.size >= 2) {
+                                            // 双指 = 捏拉缩放 + 平移（跟随式）
                                             moved = true
-                                            if (lastPinchDist == null) {
-                                                lastPinchDist = pinchDistance(ev)
-                                                lastPinchCentroid = pinchCentroid(ev)
-                                            } else {
-                                                val dist = pinchDistance(ev)
-                                                val centroid = pinchCentroid(ev)
-                                                val zoom = if (lastPinchDist > 0f) dist / lastPinchDist else 1f
+                                            val dist = pinchDistance(ev)
+                                            val centroid = pinchCentroid(ev)
+                                            if (lastPinchDist != null && lastPinchDist > 0f) {
+                                                val zoom = dist / lastPinchDist
                                                 state.scale = (state.scale * zoom).coerceIn(0.25f, 8f)
-                                                // 双指平移（centroid 移动）
                                                 val cd = centroid - lastPinchCentroid
-                                                state.offsetX -= cd.x / state.scale
-                                                state.offsetY -= cd.y / state.scale
-                                                clampViewport(state, frame.width, frame.height, canvasSize)
-                                                lastPinchDist = dist
-                                                lastPinchCentroid = centroid
+                                                panBy(cd.x, cd.y)
                                             }
+                                            lastPinchDist = dist
+                                            lastPinchCentroid = centroid
                                             continue
                                         }
                                         lastPinchDist = null
+                                        val change = pressed.firstOrNull() ?: continue
+                                        val delta = change.position - lastPos
+                                        lastPos = change.position
+                                        // 用总位移判定（手指轻微抖动不误判点击）
+                                        if ((change.position - down.position).getDistance() > tapSlopPx) moved = true
                                         if (moved) {
-                                            // 长按后拖动 = 按住左键拖（拖选/拖拽）
-                                            if (!isPointerEvent && nowMillis() - downTime > LONG_PRESS_MS) {
-                                                isPointerEvent = true
-                                                sentDown = true
-                                                client?.pointerEvent(1, state.pointerX.roundToInt(), state.pointerY.roundToInt())
-                                            }
-                                            if (!isPointerEvent) {
-                                                // 触控板模式：相对移动虚拟箭头（屏幕 px →
-                                                // framebuffer px；fit = 画布宽/帧宽）
-                                                val fit = if (canvasSize.width > 0) canvasSize.width.toFloat() / frame.width else 1f
-                                                val speed = if (delta.getDistance() > SLOW_SLOP_PX) 1.6f else 1.0f
-                                                state.pointerX = (state.pointerX + delta.x / (fit * state.scale) * speed)
-                                                    .coerceIn(0f, (frame.width - 1).toFloat())
-                                                state.pointerY = (state.pointerY + delta.y / (fit * state.scale) * speed)
-                                                    .coerceIn(0f, (frame.height - 1).toFloat())
-                                                // 箭头移动不发事件：位置随下一次点击/拖拽发送
-                                            } else {
-                                                // 按住拖：每帧更新位置+按住状态
-                                                client?.pointerEvent(1, state.pointerX.roundToInt(), state.pointerY.roundToInt())
-                                            }
+                                            // 单指拖动 = 拖动画布（内容跟随手指）
+                                            panBy(delta.x, delta.y)
                                         }
                                     }
-                                    // up：区分点击/拖动
+                                    // up：未移动 = 点击（长按右击，短按左击），作用于手指位置
                                     if (!moved) {
                                         val hold = nowMillis() - downTime
-                                        if (hold >= LONG_PRESS_MS) {
-                                            rightClickAtPointer()
-                                        } else {
-                                            leftClickAtPointer()
-                                        }
-                                    } else if (isPointerEvent && sentDown) {
-                                        client?.pointerEvent(0, state.pointerX.roundToInt(), state.pointerY.roundToInt())
+                                        clickAt(down.position.x, down.position.y, if (hold >= LONG_PRESS_MS) 4 else 1)
                                     }
                                 } catch (_: kotlinx.coroutines.CancellationException) {
-                                    if (isPointerEvent && sentDown) {
-                                        client?.pointerEvent(0, state.pointerX.roundToInt(), state.pointerY.roundToInt())
-                                    }
                                 }
                             }
                         },
@@ -373,13 +327,6 @@ fun VncContent(
                         dstSize = IntSize(dw.roundToInt(), dh.roundToInt()),
                         filterQuality = FilterQuality.Medium,
                     )
-                    // 指针光标
-                    if (state.pointerX >= 0) {
-                        val px = baseX + ox + state.pointerX * drawScale
-                        val py = baseY + oy + state.pointerY * drawScale
-                        drawCircle(Color.White, radius = 7f, center = Offset(px, py), style = Stroke(width = 2.5f))
-                        drawCircle(Color.Black, radius = 4.5f, center = Offset(px, py))
-                    }
                 }
             } else {
                 // 无帧：连接中占位
@@ -426,7 +373,7 @@ fun VncContent(
         ) {
             HorizontalDivider(color = Color.White.copy(alpha = 0.1f))
             Spacer(Modifier.height(Spacing.Xs))
-            // 两行各 8/9 键等宽（对齐终端 KeyToolbar 密度）
+            // 两行各 8 键等宽（对齐终端 KeyToolbar 8+8）；滚轮用 ⇞⇟ 区分方向键 ↑↓
             Row(
                 Modifier.fillMaxWidth().padding(horizontal = Spacing.Xs),
                 horizontalArrangement = Arrangement.spacedBy(Spacing.Xs),
@@ -436,9 +383,9 @@ fun VncContent(
                 VncToolKey("↓", state, Modifier.weight(1f)) { sendKey(KeySym.DOWN) }
                 VncToolKey("→", state, Modifier.weight(1f)) { sendKey(KeySym.RIGHT) }
                 VncToolKey(s.vnc.wheelUp, state, Modifier.weight(1f)) { wheel(true) }
-                VncToolKey(s.vnc.mouseLeft, state, Modifier.weight(1f)) { leftClickAtPointer() }
-                VncToolKey(s.vnc.mouseMiddle, state, Modifier.weight(1f)) { clickButton(2) }
-                VncToolKey(s.vnc.mouseRight, state, Modifier.weight(1f)) { rightClickAtPointer() }
+                VncToolKey(s.vnc.wheelDown, state, Modifier.weight(1f)) { wheel(false) }
+                VncToolKey(s.vnc.mouseLeft, state, Modifier.weight(1f)) { toolbarClick(1) }
+                VncToolKey(s.vnc.mouseRight, state, Modifier.weight(1f)) { toolbarClick(4) }
             }
             Spacer(Modifier.height(Spacing.Xs))
             Row(
@@ -451,8 +398,7 @@ fun VncContent(
                 VncToolKey("ESC", state, Modifier.weight(1f)) { sendKey(KeySym.ESC) }
                 VncToolKey("TAB", state, Modifier.weight(1f)) { sendKey(KeySym.TAB) }
                 VncToolKey("⌫", state, Modifier.weight(1f)) { sendKey(KeySym.BACKSPACE) }
-                VncToolKey(s.vnc.wheelDown, state, Modifier.weight(1f)) { wheel(false) }
-                VncToolKey("ENT", state, Modifier.weight(1.2f)) { sendKey(KeySym.ENTER) }
+                VncToolKey("ENT", state, Modifier.weight(1f)) { sendKey(KeySym.ENTER) }
                 VncToolKey("⌨", state, Modifier.weight(1f)) { toggleKeyboard() }
             }
             Spacer(Modifier.height(Spacing.Xs))

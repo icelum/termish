@@ -6,7 +6,6 @@ import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
-import androidx.compose.foundation.gestures.detectTransformGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -261,16 +260,6 @@ fun VncContent(
                 Canvas(
                     Modifier
                         .fillMaxSize()
-                        .pointerInput(frame.width, frame.height) {
-                            // 双指：缩放/平移视口（与虚拟鼠标手势互不干扰）
-                            detectTransformGestures { centroid, pan, zoom, _ ->
-                                state.scale = (state.scale * zoom).coerceIn(0.2f, 8f)
-                                // 保持 centroid 下的 framebuffer 点不动
-                                state.offsetX -= pan.x / state.scale
-                                state.offsetY -= pan.y / state.scale
-                                clampViewport(state, frame.width, frame.height, canvasSize)
-                            }
-                        }
                         .pointerInput(frame.width, frame.height, client) {
                             // 虚拟鼠标模式（VNC 客户端标准手感）：手指当触控板——
                             // 拖动只移动屏幕上的鼠标箭头（相对位移，不发送事件）；
@@ -281,6 +270,8 @@ fun VncContent(
                                 var last = down.position
                                 var isPointerEvent = false
                                 var sentDown = false
+                                var lastPinchDist: Float? = null
+                                var lastPinchCentroid = Offset.Zero
                                 val downTime = nowMillis()
                                 try {
                                     while (true) {
@@ -290,14 +281,35 @@ fun VncContent(
                                         val delta = change.position - last
                                         last = change.position
                                         if (delta.getDistance() > tapSlopPx) moved = true
-                                        if (ev.changes.count { it.pressed } >= 2) {
-                                            // 双指 → 交给 transform 手势：取消本手势
+                                        val pressedCount = ev.changes.count { it.pressed }
+                                        if (pressedCount >= 2) {
+                                            // 双指 = 捏拉缩放 + 双指平移（原位处理：
+                                            // 交给 detectTransformGestures 会因第二指
+                                            // 中途加入而识别不到，实测捏不动）
                                             if (isPointerEvent) {
                                                 client?.pointerEvent(0, state.pointerX.roundToInt(), state.pointerY.roundToInt())
                                                 isPointerEvent = false
                                             }
-                                            return@awaitEachGesture
+                                            moved = true
+                                            if (lastPinchDist == null) {
+                                                lastPinchDist = pinchDistance(ev)
+                                                lastPinchCentroid = pinchCentroid(ev)
+                                            } else {
+                                                val dist = pinchDistance(ev)
+                                                val centroid = pinchCentroid(ev)
+                                                val zoom = if (lastPinchDist > 0f) dist / lastPinchDist else 1f
+                                                state.scale = (state.scale * zoom).coerceIn(0.25f, 8f)
+                                                // 双指平移（centroid 移动）
+                                                val cd = centroid - lastPinchCentroid
+                                                state.offsetX -= cd.x / state.scale
+                                                state.offsetY -= cd.y / state.scale
+                                                clampViewport(state, frame.width, frame.height, canvasSize)
+                                                lastPinchDist = dist
+                                                lastPinchCentroid = centroid
+                                            }
+                                            continue
                                         }
+                                        lastPinchDist = null
                                         if (moved) {
                                             // 长按后拖动 = 按住左键拖（拖选/拖拽）
                                             if (!isPointerEvent && nowMillis() - downTime > LONG_PRESS_MS) {
@@ -506,6 +518,23 @@ private const val TAP_SLOP_PX = 24f
 /** 快速滑动时的指针加速阈值与倍率（触控板手感）。 */
 private const val SLOW_SLOP_PX = 18f
 private val tapSlopPx get() = TAP_SLOP_PX
+
+/** 双指间距。 */
+private fun pinchDistance(ev: androidx.compose.ui.input.pointer.PointerEvent): Float {
+    val ps = ev.changes.filter { it.pressed }
+    if (ps.size < 2) return 0f
+    return (ps[0].position - ps[1].position).getDistance()
+}
+
+/** 双指质心。 */
+private fun pinchCentroid(ev: androidx.compose.ui.input.pointer.PointerEvent): Offset {
+    val ps = ev.changes.filter { it.pressed }
+    if (ps.isEmpty()) return Offset.Zero
+    return Offset(
+        ps.map { it.position.x }.average().toFloat(),
+        ps.map { it.position.y }.average().toFloat(),
+    )
+}
 private fun nowMillis(): Long =
     kotlinx.datetime.Clock.System.now().toEpochMilliseconds()
 

@@ -19,6 +19,7 @@ import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.text.BasicTextField
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material3.Button
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
@@ -54,6 +55,8 @@ import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.TextRange
+import androidx.compose.ui.text.input.KeyboardCapitalization
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.IntSize
@@ -461,11 +464,18 @@ fun VncContent(
         BasicTextField(
             value = inputValue,
             onValueChange = { new ->
+                // IME 组合中的文本不发送（拼音等）：只发 committed diff
+                if (new.composition != null) return@BasicTextField
                 val old = inputValue.text
-                val diff = new.text.substring(old.length)
+                val diff = if (new.text.length >= old.length) new.text.substring(old.length) else ""
                 if (diff.isNotEmpty()) diff.forEach { sendChar(it) }
                 inputValue = TextFieldValue("", TextRange.Zero)
             },
+            keyboardOptions = KeyboardOptions(
+                keyboardType = KeyboardType.Ascii,
+                autoCorrect = false,
+                capitalization = KeyboardCapitalization.None,
+            ),
             modifier = Modifier
                 .size(1.dp)
                 .focusRequester(inputFocusRequester)

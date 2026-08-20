@@ -4,8 +4,8 @@ import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.gestures.detectDragGestures
-import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.gestures.detectTransformGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -134,7 +134,14 @@ fun VncContent(
         val f = frame ?: return@LaunchedEffect
         if (f.version == drawVersion) return@LaunchedEffect
         drawVersion = f.version
-        val bm = bitmap ?: VncBitmap(f.width, f.height).also { bitmap = it }
+        val bm = bitmap ?: VncBitmap(f.width, f.height).also {
+            bitmap = it
+            // 首帧：箭头初始置于画面中心
+            if (state.pointerX < 0) {
+                state.pointerX = f.width / 2f
+                state.pointerY = f.height / 2f
+            }
+        }
         bm.update(f.pixels)
     }
     // 远端剪贴板 → 本机
@@ -170,6 +177,31 @@ fun VncContent(
         val y = state.pointerY.takeIf { it >= 0 } ?: (frame?.height?.div(2f)) ?: return
         client?.pointerEvent(mask, x.roundToInt(), y.roundToInt())
         client?.pointerEvent(0, x.roundToInt(), y.roundToInt())
+    }
+
+    // 虚拟鼠标点击：作用于箭头位置（手指触点无关）
+    fun leftClickAtPointer() {
+        // 箭头未初始化（首帧前）时先置中
+        if (state.pointerX < 0) {
+            state.pointerX = (frame?.width ?: 640) / 2f
+            state.pointerY = (frame?.height ?: 480) / 2f
+        }
+        val x = state.pointerX.roundToInt().coerceAtLeast(0)
+        val y = state.pointerY.roundToInt().coerceAtLeast(0)
+        client?.pointerEvent(1, x, y)
+        client?.pointerEvent(0, x, y)
+    }
+
+    fun rightClickAtPointer() {
+        val x = state.pointerX.roundToInt().coerceAtLeast(0)
+        val y = state.pointerY.roundToInt().coerceAtLeast(0)
+        client?.pointerEvent(4, x, y)
+        client?.pointerEvent(0, x, y)
+    }
+
+    fun doubleClickAtPointer() {
+        leftClickAtPointer()
+        leftClickAtPointer()
     }
 
     // 键盘：隐藏输入框接收软键盘/硬件键盘
@@ -230,7 +262,7 @@ fun VncContent(
                     Modifier
                         .fillMaxSize()
                         .pointerInput(frame.width, frame.height) {
-                            // 双指：缩放/平移；单指：指针手势
+                            // 双指：缩放/平移视口（与虚拟鼠标手势互不干扰）
                             detectTransformGestures { centroid, pan, zoom, _ ->
                                 state.scale = (state.scale * zoom).coerceIn(0.2f, 8f)
                                 // 保持 centroid 下的 framebuffer 点不动
@@ -240,33 +272,71 @@ fun VncContent(
                             }
                         }
                         .pointerInput(frame.width, frame.height, client) {
-                            detectTapGestures(
-                                onTap = { pos ->
-                                    sendPointerAt(1, toFrameX(pos.x), toFrameY(pos.y))
-                                    client?.pointerEvent(0, toFrameX(pos.x).roundToInt(), toFrameY(pos.y).roundToInt())
-                                },
-                                onDoubleTap = { pos ->
-                                    val fx = toFrameX(pos.x).roundToInt()
-                                    val fy = toFrameY(pos.y).roundToInt()
-                                    client?.pointerEvent(1, fx, fy)
-                                    client?.pointerEvent(0, fx, fy)
-                                    client?.pointerEvent(1, fx, fy)
-                                    client?.pointerEvent(0, fx, fy)
-                                },
-                                onLongPress = { pos ->
-                                    val fx = toFrameX(pos.x).roundToInt()
-                                    val fy = toFrameY(pos.y).roundToInt()
-                                    client?.pointerEvent(4, fx, fy)
-                                    client?.pointerEvent(0, fx, fy)
-                                },
-                            )
-                        }
-                        .pointerInput(frame.width, frame.height, client) {
-                            // 单指拖动 = 移动指针（不带按键）
-                            detectDragGestures { change, _ ->
-                                val fx = toFrameX(change.position.x)
-                                val fy = toFrameY(change.position.y)
-                                sendPointerAt(0, fx, fy)
+                            // 虚拟鼠标模式（VNC 客户端标准手感）：手指当触控板——
+                            // 拖动只移动屏幕上的鼠标箭头（相对位移，不发送事件）；
+                            // 点按在箭头位置触发（不跳到手指位置）
+                            awaitEachGesture {
+                                val down = awaitFirstDown(requireUnconsumed = false)
+                                var moved = false
+                                var last = down.position
+                                var isPointerEvent = false
+                                var sentDown = false
+                                val downTime = nowMillis()
+                                try {
+                                    while (true) {
+                                        val ev = awaitPointerEvent()
+                                        if (ev.changes.all { !it.pressed }) break // up
+                                        val change = ev.changes.firstOrNull { it.pressed } ?: continue
+                                        val delta = change.position - last
+                                        last = change.position
+                                        if (delta.getDistance() > tapSlopPx) moved = true
+                                        if (ev.changes.count { it.pressed } >= 2) {
+                                            // 双指 → 交给 transform 手势：取消本手势
+                                            if (isPointerEvent) {
+                                                client?.pointerEvent(0, state.pointerX.roundToInt(), state.pointerY.roundToInt())
+                                                isPointerEvent = false
+                                            }
+                                            return@awaitEachGesture
+                                        }
+                                        if (moved) {
+                                            // 长按后拖动 = 按住左键拖（拖选/拖拽）
+                                            if (!isPointerEvent && nowMillis() - downTime > LONG_PRESS_MS) {
+                                                isPointerEvent = true
+                                                sentDown = true
+                                                client?.pointerEvent(1, state.pointerX.roundToInt(), state.pointerY.roundToInt())
+                                            }
+                                            if (!isPointerEvent) {
+                                                // 触控板模式：相对移动虚拟箭头（屏幕 px →
+                                                // framebuffer px；fit = 画布宽/帧宽）
+                                                val fit = if (canvasSize.width > 0) canvasSize.width.toFloat() / frame.width else 1f
+                                                val speed = if (delta.getDistance() > SLOW_SLOP_PX) 1.6f else 1.0f
+                                                state.pointerX = (state.pointerX + delta.x / (fit * state.scale) * speed)
+                                                    .coerceIn(0f, (frame.width - 1).toFloat())
+                                                state.pointerY = (state.pointerY + delta.y / (fit * state.scale) * speed)
+                                                    .coerceIn(0f, (frame.height - 1).toFloat())
+                                                // 箭头移动不发事件：位置随下一次点击/拖拽发送
+                                            } else {
+                                                // 按住拖：每帧更新位置+按住状态
+                                                client?.pointerEvent(1, state.pointerX.roundToInt(), state.pointerY.roundToInt())
+                                            }
+                                        }
+                                    }
+                                    // up：区分点击/拖动
+                                    if (!moved) {
+                                        val hold = nowMillis() - downTime
+                                        if (hold >= LONG_PRESS_MS) {
+                                            rightClickAtPointer()
+                                        } else {
+                                            leftClickAtPointer()
+                                        }
+                                    } else if (isPointerEvent && sentDown) {
+                                        client?.pointerEvent(0, state.pointerX.roundToInt(), state.pointerY.roundToInt())
+                                    }
+                                } catch (_: kotlinx.coroutines.CancellationException) {
+                                    if (isPointerEvent && sentDown) {
+                                        client?.pointerEvent(0, state.pointerX.roundToInt(), state.pointerY.roundToInt())
+                                    }
+                                }
                             }
                         },
                 ) {
@@ -341,15 +411,19 @@ fun VncContent(
         ) {
             HorizontalDivider(color = Color.White.copy(alpha = 0.1f))
             Spacer(Modifier.height(Spacing.Xs))
+            // 两行各 8/9 键等宽（对齐终端 KeyToolbar 密度）
             Row(
                 Modifier.fillMaxWidth().padding(horizontal = Spacing.Xs),
                 horizontalArrangement = Arrangement.spacedBy(Spacing.Xs),
             ) {
-                VncToolKey(s.vnc.mouseLeft, state, Modifier.weight(1f)) { clickButton(1) }
-                VncToolKey(s.vnc.mouseMiddle, state, Modifier.weight(1f)) { clickButton(2) }
-                VncToolKey(s.vnc.mouseRight, state, Modifier.weight(1f)) { clickButton(4) }
+                VncToolKey("←", state, Modifier.weight(1f)) { sendKey(KeySym.LEFT) }
+                VncToolKey("↑", state, Modifier.weight(1f)) { sendKey(KeySym.UP) }
+                VncToolKey("↓", state, Modifier.weight(1f)) { sendKey(KeySym.DOWN) }
+                VncToolKey("→", state, Modifier.weight(1f)) { sendKey(KeySym.RIGHT) }
                 VncToolKey(s.vnc.wheelUp, state, Modifier.weight(1f)) { wheel(true) }
-                VncToolKey(s.vnc.wheelDown, state, Modifier.weight(1f)) { wheel(false) }
+                VncToolKey(s.vnc.mouseLeft, state, Modifier.weight(1f)) { leftClickAtPointer() }
+                VncToolKey(s.vnc.mouseMiddle, state, Modifier.weight(1f)) { clickButton(2) }
+                VncToolKey(s.vnc.mouseRight, state, Modifier.weight(1f)) { rightClickAtPointer() }
             }
             Spacer(Modifier.height(Spacing.Xs))
             Row(
@@ -362,11 +436,8 @@ fun VncContent(
                 VncToolKey("ESC", state, Modifier.weight(1f)) { sendKey(KeySym.ESC) }
                 VncToolKey("TAB", state, Modifier.weight(1f)) { sendKey(KeySym.TAB) }
                 VncToolKey("⌫", state, Modifier.weight(1f)) { sendKey(KeySym.BACKSPACE) }
-                VncToolKey("←", state, Modifier.weight(1f)) { sendKey(KeySym.LEFT) }
-                VncToolKey("↑", state, Modifier.weight(1f)) { sendKey(KeySym.UP) }
-                VncToolKey("↓", state, Modifier.weight(1f)) { sendKey(KeySym.DOWN) }
-                VncToolKey("→", state, Modifier.weight(1f)) { sendKey(KeySym.RIGHT) }
-                VncToolKey("ENT", state, Modifier.weight(1.4f)) { sendKey(KeySym.ENTER) }
+                VncToolKey(s.vnc.wheelDown, state, Modifier.weight(1f)) { wheel(false) }
+                VncToolKey("ENT", state, Modifier.weight(1.2f)) { sendKey(KeySym.ENTER) }
                 VncToolKey("⌨", state, Modifier.weight(1f)) { toggleKeyboard() }
             }
             Spacer(Modifier.height(Spacing.Xs))
@@ -427,6 +498,16 @@ private fun VncToolKey(
         Text(label, color = fg, style = MaterialTheme.typography.labelSmall, maxLines = 1)
     }
 }
+
+/** 虚拟鼠标手势参数。 */
+private const val LONG_PRESS_MS = 500L
+/** 判定为移动的触摸 slop（px）。 */
+private const val TAP_SLOP_PX = 24f
+/** 快速滑动时的指针加速阈值与倍率（触控板手感）。 */
+private const val SLOW_SLOP_PX = 18f
+private val tapSlopPx get() = TAP_SLOP_PX
+private fun nowMillis(): Long =
+    kotlinx.datetime.Clock.System.now().toEpochMilliseconds()
 
 /** 视口钳制：平移不把画面拖出屏幕。 */
 private fun clampViewport(state: VncUiState, frameW: Int, frameH: Int, canvas: IntSize) {

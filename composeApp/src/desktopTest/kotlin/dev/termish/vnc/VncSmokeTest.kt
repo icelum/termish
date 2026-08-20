@@ -12,14 +12,14 @@ import kotlin.test.assertTrue
 /** 对本机 docker x11vnc 的端到端冒烟（127.0.0.1:5900 无 server 时跳过）。 */
 class VncSmokeTest {
     private fun serverUp(): Boolean = try {
-        java.net.Socket("127.0.0.1", 5900).use { true }
+        java.net.Socket("127.0.0.1", 5901).use { true }
     } catch (_: Exception) { false }
 
     @Test
     fun `握手并收到首帧`() {
         if (!serverUp()) return // CI/无 server 环境跳过
         val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
-        val client = RfbClient("127.0.0.1", 5900, "termish", viewOnly = false, scope = scope)
+        val client = RfbClient("127.0.0.1", 5901, "termish", viewOnly = false, scope = scope)
         runBlocking { client.connect() }
         // 等真正的首帧内容：握手会置 version=1 的空帧，增量帧 version>=2
         runBlocking {

@@ -332,6 +332,10 @@ fun VncContent(
                             }
                         },
                 ) {
+                    // 帧版本驱动重绘：ImageBitmap 内容原地更新，Compose 无法感知
+                    // （同引用），必须显式读取 version state 触发每帧重绘——否则
+                    // 锁屏时钟/画面冻结不动
+                    @Suppress("UNUSED_VARIABLE") val redrawTick = drawVersion
                     val w = frame.width.toFloat()
                     val h = frame.height.toFloat()
                     // fitScale：等比适应画布（初始 1x 视图）

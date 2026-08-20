@@ -152,7 +152,9 @@ fun VncContent(
         val f = frame ?: return@LaunchedEffect
         if (f.version == drawVersion) return@LaunchedEffect
         drawVersion = f.version
-        val bm = bitmap ?: VncBitmap(f.width, f.height).also { bitmap = it }
+        // 分辨率变化（DesktopSize，如 Mac 锁屏→登录）时重建位图，否则 update 写越界 crash
+        val bm = bitmap?.takeIf { it.width == f.width && it.height == f.height }
+            ?: VncBitmap(f.width, f.height).also { bitmap = it }
         bm.update(f.pixels)
     }
     // 远端剪贴板 → 本机

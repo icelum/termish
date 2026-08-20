@@ -14,6 +14,9 @@ actual class VncBitmap actual constructor(width: Int, height: Int) {
 
     actual val image: ImageBitmap get() = bitmap.asImageBitmap()
 
+    actual val width: Int get() = bitmap.width
+    actual val height: Int get() = bitmap.height
+
     actual fun recycle() {
         bitmap.recycle()
     }

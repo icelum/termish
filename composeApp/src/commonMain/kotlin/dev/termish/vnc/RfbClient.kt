@@ -281,7 +281,7 @@ class RfbClient(
     private var reader: Reader? = null
 
     /** ZRLE 持久 zlib 流（RFC 6143 §7.7.6：同一流跨矩形/跨帧延续）。 */
-    private val zrleInflater = VncInflater()
+    private var zrleInflater = VncInflater()
     /** 已解压的 ZRLE 字节流（累积；[zrlePos] 之前为已消费）。 */
     private var zrleData = ByteArray(0)
     private var zrlePos = 0
@@ -345,6 +345,13 @@ class RfbClient(
                     frameWidth = x
                     frameHeight = y
                     pixels = IntArray(x * y)
+                    // 分辨率变化：ZRLE 流状态不可跨分辨率延续（旧 tile 坐标/pending
+                    // 会写入新帧越界）——重建 inflater + 清缓冲/pending
+                    zrleInflater.end()
+                    zrleInflater = VncInflater()
+                    zrleData = ByteArray(0)
+                    zrlePos = 0
+                    zrlePending = null
                     requestFramebufferUpdate(sock, incremental = false)
                 }
                 enc == ENC_RAW -> decodeRaw(r, x, y, w, h)

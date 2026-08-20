@@ -10,5 +10,7 @@ expect class VncBitmap(width: Int, height: Int) {
     /** 写入整帧像素（0xAARRGGBB，长度 = width * height）。 */
     fun update(pixels: IntArray)
     val image: ImageBitmap
+    val width: Int
+    val height: Int
     fun recycle()
 }

@@ -1,5 +1,9 @@
 package dev.termish.ui
 
+import androidx.compose.animation.core.Animatable
+import androidx.compose.animation.core.LinearEasing
+import androidx.compose.animation.core.tween
+
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -43,6 +47,7 @@ import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.FilterQuality
+import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.input.key.Key
 import androidx.compose.ui.input.key.KeyEvent
 import androidx.compose.ui.input.key.KeyEventType
@@ -84,6 +89,10 @@ class VncUiState {
     /** 指针当前位置（framebuffer 坐标），工具栏按钮作用点。 */
     var pointerX by mutableFloatStateOf(-1f)
     var pointerY by mutableFloatStateOf(-1f)
+    /** 点击反馈：每次点击/长按递增，坐标（framebuffer）+ 版本驱动画布涟漪。 */
+    var feedbackX by mutableFloatStateOf(0f)
+    var feedbackY by mutableFloatStateOf(0f)
+    var feedbackVersion by mutableStateOf(0L)
     var keyboardVisible by mutableStateOf(false)
     /** 粘滞修饰键：按下后修饰下一键。 */
     var stickyCtrl by mutableStateOf(false)
@@ -131,6 +140,14 @@ fun VncContent(
     var drawVersion by remember(client) { mutableStateOf(0L) }
     var bitmap by remember(client) { mutableStateOf<VncBitmap?>(null) }
     var canvasSize by remember { mutableStateOf(IntSize.Zero) }
+    // 点击反馈涟漪：版本变化时重播淡出动画
+    val feedbackAnim = remember { Animatable(0f) }
+    LaunchedEffect(state.feedbackVersion) {
+        if (state.feedbackVersion > 0) {
+            feedbackAnim.snapTo(1f)
+            feedbackAnim.animateTo(0f, tween(360, easing = LinearEasing))
+        }
+    }
     LaunchedEffect(client, frame?.version) {
         val f = frame ?: return@LaunchedEffect
         if (f.version == drawVersion) return@LaunchedEffect
@@ -169,6 +186,10 @@ fun VncContent(
         // 记录最后交互位置：工具栏左/右键在没有触摸时作用于这里
         state.pointerX = fx
         state.pointerY = fy
+        // 点击反馈：画布画一个淡出圆圈
+        state.feedbackX = fx
+        state.feedbackY = fy
+        state.feedbackVersion++
         TermLog.d("vnc-ui") { "click mask=$mask at $x,$y client=$client" }
         client?.pointerEvent(mask, x, y)
         client?.pointerEvent(0, x, y)
@@ -327,6 +348,18 @@ fun VncContent(
                         dstSize = IntSize(dw.roundToInt(), dh.roundToInt()),
                         filterQuality = FilterQuality.Medium,
                     )
+                    // 点击反馈涟漪：点击处淡出圆圈（位置跟随视口换算）
+                    if (feedbackAnim.value > 0.01f && state.feedbackVersion > 0) {
+                        val cx = baseX + ox + state.feedbackX * drawScale
+                        val cy = baseY + oy + state.feedbackY * drawScale
+                        val r = (18f + 26f * (1f - feedbackAnim.value)) * drawScale.coerceAtLeast(0.3f)
+                        drawCircle(
+                            color = Color.White.copy(alpha = 0.85f * feedbackAnim.value),
+                            radius = r,
+                            center = Offset(cx, cy),
+                            style = Stroke(width = 3.dp.toPx()),
+                        )
+                    }
                 }
             } else {
                 // 无帧：连接中占位

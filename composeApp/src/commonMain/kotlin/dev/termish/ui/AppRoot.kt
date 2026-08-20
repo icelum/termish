@@ -346,6 +346,12 @@ fun AppRoot(repository: HostRepository) {
     // 直接跳回主机 tab——二级页开着却无处返回）
     var homeTab by remember { mutableStateOf(HomeTab.HOSTS) }
     var settingsSubPage by remember { mutableStateOf<SettingsSubPage?>(null) }
+    // 选主机/编辑覆盖层打开时优先拦截返回（LIFO：后注册先触发）：
+    // 不拦的话 screen==Home 分支把返回放给系统 → 直接退 app
+    PlatformBackHandler(enabled = vncEditHostId != null) { vncEditHostId = null }
+    PlatformBackHandler(enabled = vncPickerVisible) { vncPickerVisible = false }
+    PlatformBackHandler(enabled = sftpPickerVisible) { sftpPickerVisible = false }
+
     PlatformBackHandler(enabled = screen != Screen.Home || settingsSubPage != null || homeTab != HomeTab.HOSTS) {
         when {
             screen != Screen.Home -> screen = Screen.Home

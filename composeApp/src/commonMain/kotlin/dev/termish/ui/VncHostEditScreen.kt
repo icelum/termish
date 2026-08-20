@@ -1,5 +1,6 @@
 package dev.termish.ui
 
+import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -60,7 +61,11 @@ fun VncHostEditScreen(
     var viewOnly by remember { mutableStateOf(existing?.viewOnly ?: false) }
     var confirmDelete by remember { mutableStateOf(false) }
 
-    Column(Modifier.fillMaxSize().imePadding()) {
+    // 覆盖层拦截系统返回：先关编辑页，不穿透退 app
+    PlatformBackHandler(enabled = true) { onBack() }
+
+    // 必须画背景：覆盖层叠在底页之上，无背景会透明透出下层内容
+    Column(Modifier.fillMaxSize().imePadding().background(MaterialTheme.colorScheme.background)) {
         // header
         Row(
             Modifier.fillMaxWidth().padding(horizontal = 4.dp, vertical = 4.dp),
